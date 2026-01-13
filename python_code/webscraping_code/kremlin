@@ -1,0 +1,1280 @@
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+import argparse
+import csv
+import hashlib
+import html
+import json
+import os
+import random
+import re
+import shutil
+import time
+from dataclasses import dataclass
+from typing import Dict, Iterable, List, Optional, Set, Tuple
+from urllib.parse import urljoin
+
+import requests
+from bs4 import BeautifulSoup
+from dateutil import parser as dateparser
+
+
+# ---------------------------
+# STRICT OUTPUT SCHEMA (exactly as user provided)
+# ---------------------------
+
+FIELDNAMES = [
+    "id",
+    "url",
+    "full_text_word_count",
+    "date",
+    "year",
+    "month",
+    "day",
+    "time",
+    "location",
+    "latitude",
+    "longitude",
+    "page_summary",
+    "speakers",
+    "declared_geography",
+    "declared_topics",
+    "declared_persons",
+    "curated_topic_id",
+    "curated_text_topic_label",
+    "curated_text_topic_group",
+    "curated_topic_probabilities",
+    "stored_image_filepaths",
+    "saved_images_count",
+    "declared_images_count",
+    "missing_images_count",
+    "image_captions",
+    "curated_image_topic_ids",
+    "curated_image_topic_labels",
+    "curated_image_group_names",
+    "curated_image_topic_probabilities",
+]
+
+
+# ---------------------------
+# Regex & constants
+# ---------------------------
+
+BLOCK_STATUSES_DEFAULT = {403, 429, 503}
+
+IMG_EXT_RE = re.compile(r"\.(?:jpg|jpeg|png)(?:\?|$)", re.I)
+SRCSET_PART_RE = re.compile(r"\s*(\S+)(?:\s+(\d+(?:\.\d+)?)(w|x))?\s*")
+PHOTO_ID_RE = re.compile(r"\bphoto-(\d+)\b", re.I)
+
+
+@dataclass
+class Config:
+    lang: str                       # "ru" or "en"
+    base_url: str                   # must end with /
+    accept_language: str
+
+    out_csv: str
+    index_csv: str
+    images_root: str
+    manifest_root: str
+
+    start_id: int
+    end_id: int
+
+    prefer_photos_page: bool
+    strict_cap_to_declared: bool
+    purge_before_save: bool
+    force_jpg_ext: bool             # enforce .jpg filenames
+
+    delay_between_ids: float
+    delay_between_pages: float
+    timeout: int
+
+    max_transport_retries: int
+    max_id_retries: int
+    backoff_base: float
+    backoff_jitter: float
+    block_statuses: Set[int]
+
+    proxy_mode: str                 # "none" | "static" | "rotating"
+    static_proxy: str
+    proxy_list: List[str]
+    rotate_every_seconds: float
+
+def default_base_and_lang(lang: str) -> Tuple[str, str]:
+    """
+    Returns (base_url, accept_language)
+    """
+    lang = (lang or "ru").strip().lower()
+    if lang == "en":
+        # Prefer EN; allow RU fallback
+        return (
+            "https://en.kremlin.ru/events/president/transcripts/",
+            "en-US,en;q=0.9,ru-RU;q=0.4,ru;q=0.3",
+        )
+    # RU default; allow EN fallback
+    return (
+        "https://kremlin.ru/events/president/transcripts/",
+        "ru-RU,ru;q=0.9,en-US;q=0.6,en;q=0.4",
+    )
+
+
+def build_headers(accept_language: str) -> Dict[str, str]:
+    return {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language": accept_language,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Connection": "keep-alive",
+    }
+
+
+# ---------------------------
+# Small helpers
+# ---------------------------
+
+def clean_text(s: str) -> str:
+    if not s:
+        return ""
+    s = html.unescape(s)
+    s = re.sub(r"\r\n|\r", "\n", s)
+    s = re.sub(r"[ \t\u00A0]+", " ", s)
+    s = re.sub(r"\n{3,}", "\n\n", s)
+    return s.strip()
+
+
+def strip_trailing_garbage(txt: str) -> str:
+    if not txt:
+        return txt
+    txt = re.sub(r"\s*(?:\u2026)\s*[\'\"”»]*\s*$", "", txt)
+    txt = txt.rstrip(' \t\r\n\u00A0\u200B\u200C\u200D\u2060\ufeff\uFFFD<>«»“”"\'·•…—–-')
+    return txt.strip()
+
+
+def hash_bytes(b: bytes) -> str:
+    return hashlib.sha256(b).hexdigest()
+
+
+def is_thumbnail_like(u: str) -> bool:
+    if not u:
+        return False
+    low = u.lower()
+    # do NOT treat /small/ as thumbnail; we use it as fallback
+    return any(p in low for p in ("/thumb", "/preview", "/mini/"))
+
+
+def uniq_in_order(seq: Iterable[str]) -> List[str]:
+    seen = set()
+    out = []
+    for x in seq:
+        if x and x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
+
+
+def make_size_variants(u: str) -> List[str]:
+    """
+    Prefer larger variants when Kremlin uses size folders.
+    Order: original -> inferred big2x/big/small -> original (fallback)
+    """
+    if not u:
+        return []
+    cand: List[str] = []
+
+    if "/small2x/" in u:
+        cand += [u.replace("/small2x/", "/big2x/"), u.replace("/small2x/", "/big/")]
+    if "/small/" in u:
+        cand += [u.replace("/small/", "/big2x/"), u.replace("/small/", "/big/")]
+    if "/big/" in u:
+        cand += [u.replace("/big/", "/big2x/"), u.replace("/big/", "/small/")]
+    if "/big2x/" in u:
+        cand += [u.replace("/big2x/", "/big/"), u.replace("/big2x/", "/small/")]
+
+    cand = [u] + cand + [u]
+    return uniq_in_order(cand)
+
+
+def norm_url(base_url: str, u: str) -> Optional[str]:
+    if not u:
+        return None
+    u = html.unescape(u.strip()).strip("'\"")
+    if u.startswith("//"):
+        u = "https:" + u
+    return urljoin(base_url, u)
+
+
+def best_from_srcset(base_url: str, srcset: str) -> Optional[str]:
+    if not srcset:
+        return None
+    best_url, best_metric = None, -1.0
+    for part in srcset.split(","):
+        m = SRCSET_PART_RE.match(part.strip())
+        if not m:
+            continue
+        url_raw, num, unit = m.groups()
+        url_abs = norm_url(base_url, url_raw)
+        if not url_abs:
+            continue
+        metric = float(num) if num else 1.0
+        if unit == "x":
+            metric *= 10000.0
+        if metric > best_metric:
+            best_metric = metric
+            best_url = url_abs
+    return best_url
+
+
+def safe_bs4(html_text: str) -> BeautifulSoup:
+    try:
+        return BeautifulSoup(html_text, "lxml")
+    except Exception:
+        return BeautifulSoup(html_text, "html.parser")
+
+
+# ---------------------------
+# HTTP client with optional proxy rotation
+# ---------------------------
+
+class HttpClient:
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.session = requests.Session()
+        self.headers = build_headers(cfg.accept_language)
+
+        adapter = requests.adapters.HTTPAdapter(max_retries=0)
+        self.session.mount("http://", adapter)
+        self.session.mount("https://", adapter)
+
+        self._last_proxy_switch = 0.0
+        self._proxy_idx = -1
+
+        if self.cfg.proxy_mode == "rotating" and not self.cfg.proxy_list:
+            print("[proxy] proxy_mode=rotating but proxy_list empty -> using proxy_mode=none")
+            self.cfg.proxy_mode = "none"
+
+        self._switch_proxy(force=True)
+
+    def _format_proxy_dict(self, proxy_url: str) -> Dict[str, str]:
+        if not proxy_url:
+            return {}
+        return {"http": proxy_url, "https": proxy_url}
+
+    def _switch_proxy(self, force: bool = False) -> None:
+        now = time.monotonic()
+        if not force and (now - self._last_proxy_switch) < self.cfg.rotate_every_seconds:
+            return
+
+        if self.cfg.proxy_mode == "none":
+            self.session.proxies = {}
+        elif self.cfg.proxy_mode == "static":
+            self.session.proxies = self._format_proxy_dict(self.cfg.static_proxy)
+        elif self.cfg.proxy_mode == "rotating":
+            self._proxy_idx = (self._proxy_idx + 1) % len(self.cfg.proxy_list)
+            self.session.proxies = self._format_proxy_dict(self.cfg.proxy_list[self._proxy_idx])
+        else:
+            self.session.proxies = {}
+
+        self._last_proxy_switch = now
+
+    def request(self, method: str, url: str, **kwargs) -> requests.Response:
+        self._switch_proxy(force=False)
+        last_exc = None
+        r: Optional[requests.Response] = None
+
+        for attempt in range(self.cfg.max_transport_retries):
+            try:
+                r = self.session.request(
+                    method,
+                    url,
+                    headers=self.headers,
+                    timeout=self.cfg.timeout,
+                    allow_redirects=True,
+                    **kwargs
+                )
+                if (
+                    r is not None
+                    and r.status_code in self.cfg.block_statuses
+                    and self.cfg.proxy_mode in ("static", "rotating")
+                ):
+                    print(f"[proxy] {method} {url} -> {r.status_code}, rotate + retry ({attempt+1}/{self.cfg.max_transport_retries})")
+                    self._switch_proxy(force=True)
+                    continue
+                return r
+            except requests.RequestException as e:
+                last_exc = e
+                if self.cfg.proxy_mode in ("static", "rotating"):
+                    print(f"[proxy] NET error {method} {url}: {e}. rotate + retry ({attempt+1}/{self.cfg.max_transport_retries})")
+                    self._switch_proxy(force=True)
+                    continue
+                raise
+
+        if r is not None:
+            return r
+        if last_exc:
+            raise last_exc
+        raise RuntimeError("request failed with no response and no exception")
+
+
+# ---------------------------
+# Parsing (only what we actually use)
+# ---------------------------
+
+def parse_title(soup: BeautifulSoup) -> str:
+    for sel in ['h1[itemprop="headline"]', "h1.entry-title", "h1.post__title", "article h1", "h1"]:
+        el = soup.select_one(sel)
+        if el and el.get_text(strip=True):
+            return el.get_text(" ", strip=True)
+    return ""
+
+
+def parse_date_fields(soup: BeautifulSoup) -> Tuple[str, str, str, str, str]:
+    """
+    Prefer machine-readable time[datetime].
+    """
+    dt = None
+    t = soup.select_one("time[datetime]")
+    if t and t.get("datetime"):
+        try:
+            dt = dateparser.parse(t["datetime"].strip())
+        except Exception:
+            dt = None
+
+    tim = ""
+    tdiv = soup.select_one("div.read__time")
+    if tdiv and tdiv.get_text(strip=True):
+        tim = tdiv.get_text(strip=True)
+
+    if not dt:
+        for el in soup.select("time[datetime]"):
+            try:
+                dt = dateparser.parse((el.get("datetime") or "").strip())
+                if dt:
+                    break
+            except Exception:
+                pass
+
+    date_str = month = day = year = ""
+    if dt:
+        month = dt.strftime("%B")
+        day = str(dt.day)
+        year = str(dt.year)
+        date_str = f"{month} {day}, {year}"
+        if not tim:
+            tim = dt.strftime("%H:%M")
+    return date_str, month, day, year, tim
+
+
+def parse_location(soup: BeautifulSoup) -> str:
+    for el in soup.select(".read__place.p-location, .p-location, .read__place, [itemprop='location'], [itemprop='contentLocation']"):
+        for i_tag in el.find_all("i"):
+            i_tag.decompose()
+        txt = el.get_text(" ", strip=True)
+        txt = re.sub(r'^[«“"]\s*(.*?)\s*[»”"]$', r"\1", txt).strip()
+        if txt and "publication date" not in txt.lower():
+            return txt
+    return ""
+
+
+def parse_topics(soup: BeautifulSoup) -> List[str]:
+    for sel in [".read__tags a", "section.tags a", ".post__tags a", ".tags a", "a[rel='tag']"]:
+        tags = [a.get_text(" ", strip=True) for a in soup.select(sel) if a.get_text(strip=True)]
+        if tags:
+            return tags
+    return []
+
+
+def strip_noise_blocks(soup: BeautifulSoup) -> None:
+    for selector in [
+        ".read__bottommeta",
+        ".read__tags",
+        ".read__status",
+        ".hidden-copy",
+        "nav",
+        "aside",
+        "script",
+        "style",
+        ".breadcrumbs",
+        ".share",
+        ".social",
+    ]:
+        for el in soup.select(selector):
+            try:
+                el.decompose()
+            except Exception:
+                pass
+
+
+def parse_body_text(soup: BeautifulSoup) -> str:
+    """
+    Extract full text to compute word count.
+    """
+    strip_noise_blocks(soup)
+    body = None
+    for sel in [
+        '[itemprop="articleBody"]',
+        "article .entry-content",
+        "article .post__text",
+        "article .text",
+        "article",
+        ".content",
+    ]:
+        el = soup.select_one(sel)
+        if el:
+            body = el
+            break
+
+    if body:
+        parts: List[str] = []
+        for tag in body.find_all(["p", "li", "blockquote", "h2", "h3"], recursive=True):
+            txt = tag.get_text(" ", strip=True)
+            if txt:
+                parts.append(txt)
+        return strip_trailing_garbage(clean_text("\n".join(parts)))
+
+    return strip_trailing_garbage(clean_text(soup.get_text("\n", strip=True)))
+
+
+def extract_page_summary(soup: BeautifulSoup) -> str:
+    md = soup.find("meta", attrs={"name": "description"})
+    if md and md.get("content") and md["content"].strip():
+        return md["content"].strip()
+    for sel in [".lead", ".intro", ".standfirst", ".summary", ".read__lead"]:
+        el = soup.select_one(sel)
+        if el and el.get_text(strip=True):
+            return el.get_text(" ", strip=True)
+    return ""
+
+
+def extract_declared_photos_count(soup: BeautifulSoup) -> Optional[int]:
+    """
+    The photo tab counter is numeric on both RU/EN.
+    """
+    el = soup.select_one(".tabs_photo .tabs__count")
+    if el:
+        m = re.search(r"(\d+)", (el.get_text(" ", strip=True) or ""))
+        if m:
+            return int(m.group(1))
+
+    el = soup.select_one(".read__length")
+    if el:
+        m = re.search(r"(\d+)", (el.get_text(" ", strip=True) or ""))
+        if m:
+            return int(m.group(1))
+
+    el = soup.select_one(".read__status .tabs__count")
+    if el:
+        m = re.search(r"(\d+)", (el.get_text(" ", strip=True) or ""))
+        if m:
+            return int(m.group(1))
+
+    return None
+
+
+# ---------------------------
+# Image discovery
+# ---------------------------
+
+def extract_caption_for_img(img_tag) -> str:
+    fig = img_tag.find_parent("figure")
+    if fig:
+        fc = fig.find("figcaption")
+        if fc:
+            t = fc.get_text(" ", strip=True)
+            if t:
+                return t
+
+    alt = (img_tag.get("alt") or "").strip()
+    if alt:
+        return alt
+    title = (img_tag.get("title") or "").strip()
+    return title or ""
+
+
+def pick_photo_id(tag) -> Optional[str]:
+    ids = [tag.get("id", ""), " ".join(tag.get("class", []))]
+    parent = tag.find_parent(True)
+    if parent:
+        ids += [parent.get("id", ""), " ".join(parent.get("class", []))]
+    for s in ids:
+        if not s:
+            continue
+        m = PHOTO_ID_RE.search(s)
+        if m:
+            return m.group(1)
+    return None
+
+
+def iter_slider_images(soup: BeautifulSoup, base_url: str) -> Iterable[Tuple[str, str, Optional[str]]]:
+    root = soup.select_one(".entry-content.read__internal_content") or soup
+    slides = root.select(".slider__slides img")
+    seen = set()
+
+    for img in slides:
+        cand = img.get("src") or img.get("data-src") or img.get("data-original")
+        cand = best_from_srcset(base_url, img.get("srcset") or img.get("data-srcset")) or cand
+        u = norm_url(base_url, cand)
+        if not u or u in seen:
+            continue
+        seen.add(u)
+        cap = (img.get("data-text") or img.get("alt") or "").strip()
+        yield u, cap, pick_photo_id(img)
+
+
+def iter_html_images(soup: BeautifulSoup, base_url: str) -> Iterable[Tuple[str, str, Optional[str]]]:
+    seen = set()
+    root = soup.select_one("article") or soup
+
+    for img in root.find_all("img"):
+        cand = (
+            img.get("src")
+            or img.get("data-src")
+            or img.get("data-original")
+            or img.get("data-original-src")
+            or img.get("data-lazy")
+        )
+        cand = best_from_srcset(base_url, img.get("srcset") or img.get("data-srcset")) or cand
+        u = norm_url(base_url, cand)
+        if u and u not in seen:
+            seen.add(u)
+            yield u, extract_caption_for_img(img), pick_photo_id(img)
+
+    for picture in root.find_all("picture"):
+        for source in picture.find_all("source"):
+            u = best_from_srcset(base_url, source.get("srcset"))
+            if u and u not in seen:
+                seen.add(u)
+                yield u, "", pick_photo_id(source)
+
+    for nos in root.find_all("noscript"):
+        nsoup = safe_bs4(nos.get_text() or "")
+        for img in nsoup.find_all("img"):
+            cand = img.get("src") or img.get("data-src") or img.get("data-original")
+            cand = best_from_srcset(base_url, img.get("srcset") or img.get("data-srcset")) or cand
+            u = norm_url(base_url, cand)
+            if u and u not in seen:
+                seen.add(u)
+                yield u, extract_caption_for_img(img), pick_photo_id(img)
+
+    for a in root.find_all("a", href=True):
+        if IMG_EXT_RE.search(a["href"]):
+            u = norm_url(base_url, a["href"])
+            if u and u not in seen:
+                seen.add(u)
+                cap = a.get("title") or a.get_text(" ", strip=True) or ""
+                fig = a.find_parent("figure")
+                if fig:
+                    fc = fig.find("figcaption")
+                    if fc:
+                        cap = fc.get_text(" ", strip=True) or cap
+                yield u, cap, pick_photo_id(a)
+
+
+# ---------------------------
+# Fetch soup
+# ---------------------------
+
+def fetch_soup(client: HttpClient, url: str) -> Tuple[Optional[BeautifulSoup], Optional[int], str]:
+    # best-effort fast 404 check
+    try:
+        h = client.request("HEAD", url)
+        if h is not None and h.status_code == 404:
+            return None, 404, url
+    except requests.RequestException:
+        pass
+
+    try:
+        r = client.request("GET", url)
+        status = r.status_code
+        final_url = r.url
+        ctype = r.headers.get("Content-Type", "")
+        if "text/html" not in ctype:
+            return None, status, final_url
+        if len(r.text or "") < 400:
+            return None, status, final_url
+        return safe_bs4(r.text), status, final_url
+    except requests.RequestException:
+        return None, None, url
+
+
+# ---------------------------
+# Image saving
+# ---------------------------
+
+def remove_dir_if_exists(dst_dir: str) -> None:
+    if os.path.isdir(dst_dir):
+        try:
+            shutil.rmtree(dst_dir)
+        except Exception:
+            pass
+
+
+def purge_images_dir(dst_dir: str) -> None:
+    if os.path.isdir(dst_dir):
+        for fn in os.listdir(dst_dir):
+            if fn.lower().endswith((".jpg", ".jpeg", ".png")):
+                try:
+                    os.remove(os.path.join(dst_dir, fn))
+                except Exception:
+                    pass
+
+
+def download_image_bytes(client: HttpClient, url: str) -> Tuple[bytes, str]:
+    r = client.request("GET", url, stream=False)
+    r.raise_for_status()
+    return r.content, (r.headers.get("Content-Type", "") or "")
+
+
+def choose_ext(force_jpg: bool, content_type: str, blob: bytes) -> str:
+    if force_jpg:
+        return ".jpg"
+    ct = (content_type or "").lower()
+    if "png" in ct:
+        return ".png"
+    if "jpeg" in ct or "jpg" in ct:
+        return ".jpg"
+    if blob.startswith(b"\x89PNG"):
+        return ".png"
+    return ".jpg"
+
+
+def save_image(
+    client: HttpClient,
+    image_url: str,
+    dst_dir: str,
+    hashes: Set[str],
+    speech_id: str,
+    seq_counter: List[int],
+    recs: List[dict],
+    source: str,
+    page_url: str,
+    caption: str,
+    force_jpg_ext: bool,
+) -> Optional[str]:
+    """
+    Saves ONE image as: <ID>_<seq>.jpg (seq starts at 0)
+    Returns relative path: "<ID>/<ID>_<seq>.jpg"
+    """
+    try:
+        if is_thumbnail_like(image_url):
+            recs.append({"page_url": page_url, "source": source, "image_url": image_url,
+                         "status": "skipped-thumb", "local_path": None, "bytes": 0, "sha256": None, "caption": caption})
+            return None
+
+        candidates = make_size_variants(image_url)
+        blob = None
+        ctype = ""
+        final_url = None
+
+        for cand in candidates:
+            try:
+                data, ct = download_image_bytes(client, cand)
+                ct_low = (ct or "").lower()
+
+                # accept only raster images
+                if ct_low and (not ct_low.startswith("image/") or any(x in ct_low for x in ("svg", "gif", "webp", "bmp", "tif", "tiff"))):
+                    continue
+
+                # if content-type missing, sniff basic headers
+                if not ct_low:
+                    if not (data.startswith(b"\xff\xd8") or data.startswith(b"\x89PNG")):
+                        continue
+
+                blob = data
+                ctype = ct
+                final_url = cand
+                break
+            except requests.RequestException:
+                continue
+
+        if blob is None:
+            recs.append({"page_url": page_url, "source": source, "image_url": image_url,
+                         "status": "failed-all-variants", "local_path": None, "bytes": 0, "sha256": None, "caption": caption})
+            return None
+
+        h = hash_bytes(blob)
+        if h in hashes:
+            recs.append({"page_url": page_url, "source": source, "image_url": final_url or image_url,
+                         "status": "skipped-dup", "local_path": None, "bytes": len(blob), "sha256": h, "caption": caption})
+            return None
+
+        os.makedirs(dst_dir, exist_ok=True)
+
+        seq_counter[0] += 1
+        ext = choose_ext(force_jpg_ext, ctype, blob)
+
+        filename = f"{speech_id}_{seq_counter[0]}{ext}"
+        out_abs = os.path.join(dst_dir, filename)
+
+        with open(out_abs, "wb") as f:
+            f.write(blob)
+
+        hashes.add(h)
+        recs.append({"page_url": page_url, "source": source, "image_url": final_url or image_url,
+                     "status": "saved", "local_path": out_abs, "bytes": len(blob), "sha256": h, "caption": caption})
+
+        rel = os.path.join(speech_id, filename).replace("\\", "/")
+        return rel
+
+    except Exception:
+        recs.append({"page_url": page_url, "source": source, "image_url": image_url,
+                     "status": "failed-exception", "local_path": None, "bytes": 0, "sha256": None, "caption": caption})
+        return None
+
+
+# ---------------------------
+# Page processing
+# ---------------------------
+
+def process_page(
+    client: HttpClient,
+    url: str,
+    speech_id: str,
+    dst_dir: str,
+    hashes: Set[str],
+    recs: List[dict],
+    seq_counter: List[int],
+    logical_seen: Set[str],
+    source_label: str,
+    force_jpg_ext: bool,
+) -> Tuple[int, int, List[str], List[str], str, Optional[int], Optional[BeautifulSoup], Optional[int]]:
+    """
+    Returns:
+      found_count, saved_count, rel_paths, captions, final_url, status, soup, declared_count
+    """
+    soup, status, final_url = fetch_soup(client, url)
+    if not soup:
+        return 0, 0, [], [], final_url, status, None, None
+
+    declared_count = extract_declared_photos_count(soup)
+
+    rel_paths: List[str] = []
+    caps: List[str] = []
+    page_seen_keys: Set[str] = set()
+
+    def handle_candidate(u: str, cap: str, pid: Optional[str], save_source: str) -> None:
+        if not u or is_thumbnail_like(u):
+            return
+
+        page_seen_keys.add(pid or u)
+
+        if pid and pid in logical_seen:
+            return
+
+        saved_rel = save_image(
+            client=client,
+            image_url=u,
+            dst_dir=dst_dir,
+            hashes=hashes,
+            speech_id=speech_id,
+            seq_counter=seq_counter,
+            recs=recs,
+            source=save_source,
+            page_url=final_url,
+            caption=cap,
+            force_jpg_ext=force_jpg_ext,
+        )
+        if saved_rel:
+            rel_paths.append(saved_rel)
+            caps.append(cap)
+            if pid:
+                logical_seen.add(pid)
+
+    used_slider = False
+    if source_label == "main":
+        for u, cap, pid in iter_slider_images(soup, final_url):
+            handle_candidate(u, cap, pid, "main-slider")
+        used_slider = len(page_seen_keys) > 0
+
+    if not used_slider:
+        for u, cap, pid in iter_html_images(soup, final_url):
+            handle_candidate(u, cap, pid, f"{source_label}-html")
+
+    return len(page_seen_keys), len(rel_paths), rel_paths, caps, final_url, status, soup, declared_count
+
+
+def crawl_photos_pagination(
+    client: HttpClient,
+    first_photos_url: str,
+    speech_id: str,
+    dst_dir: str,
+    hashes: Set[str],
+    recs: List[dict],
+    seq_counter: List[int],
+    logical_seen: Set[str],
+    delay_between_pages: float,
+    force_jpg_ext: bool,
+) -> Tuple[List[str], List[str], Optional[int]]:
+    all_paths: List[str] = []
+    all_caps: List[str] = []
+
+    fc, sc, p1, c1, final_url, status, soup, decl = process_page(
+        client=client,
+        url=first_photos_url,
+        speech_id=speech_id,
+        dst_dir=dst_dir,
+        hashes=hashes,
+        recs=recs,
+        seq_counter=seq_counter,
+        logical_seen=logical_seen,
+        source_label="photos",
+        force_jpg_ext=force_jpg_ext,
+    )
+    declared_total_local = decl
+
+    all_paths += p1
+    all_caps += c1
+
+    if soup:
+        next_urls: List[str] = []
+
+        a_next = soup.find("a", rel=lambda v: v and "next" in v)
+        if a_next and a_next.get("href"):
+            next_urls.append(norm_url(final_url, a_next["href"]) or "")
+
+        ru_tokens = ("след", "далее", "впер", "старше", "ранее", "позже")
+        for a in soup.select(".pagination a, nav a, .pager a, .pages a"):
+            t = (a.get_text(" ", strip=True) or "").lower()
+            if (("next" in t) or ("older" in t) or any(tok in t for tok in ru_tokens) or t in {">", "»"}) and a.get("href"):
+                next_urls.append(norm_url(final_url, a.get("href")) or "")
+
+        seen = set()
+        for nx in next_urls:
+            if not nx or nx in seen:
+                continue
+            seen.add(nx)
+
+            fc2, sc2, p2, c2, _, _, soup2, decl2 = process_page(
+                client=client,
+                url=nx,
+                speech_id=speech_id,
+                dst_dir=dst_dir,
+                hashes=hashes,
+                recs=recs,
+                seq_counter=seq_counter,
+                logical_seen=logical_seen,
+                source_label="photos-page",
+                force_jpg_ext=force_jpg_ext,
+            )
+            if decl2 is not None and declared_total_local is None:
+                declared_total_local = decl2
+
+            all_paths += p2
+            all_caps += c2
+            time.sleep(delay_between_pages)
+
+    return all_paths, all_caps, declared_total_local
+
+
+# ---------------------------
+# Strict row construction
+# ---------------------------
+
+def empty_row() -> Dict[str, object]:
+    # use object type to allow ints; csv writer will stringify
+    return {k: "" for k in FIELDNAMES}
+
+
+# ---------------------------
+# Per-ID harvest
+# ---------------------------
+
+def harvest_one_id(client: HttpClient, cfg: Config, speech_id_int: int) -> Tuple[Optional[dict], Optional[int], str]:
+    """
+    Returns: (row or None, status_code_of_main, title_for_logging)
+    """
+    sid = str(speech_id_int)
+    dst_dir = os.path.join(cfg.images_root, sid)
+    manifest_path = os.path.join(cfg.manifest_root, f"{sid}.jsonl")
+    os.makedirs(cfg.manifest_root, exist_ok=True)
+
+    if cfg.purge_before_save:
+        purge_images_dir(dst_dir)
+
+    main_url = urljoin(cfg.base_url, sid)
+    photos_url = main_url.rstrip("/") + "/photos"
+    order = [("photos", photos_url), ("main", main_url)] if cfg.prefer_photos_page else [("main", main_url), ("photos", photos_url)]
+
+    # Prefetch main to check 404 + parse article content
+    pre_soup, pre_status, pre_final = fetch_soup(client, main_url)
+    if pre_status == 404:
+        remove_dir_if_exists(dst_dir)
+        return None, 404, ""
+
+    article_soup = pre_soup
+    final_article_url = pre_final or main_url
+
+    recs: List[dict] = []
+    hashes: Set[str] = set()
+    seq_counter = [-1]  # becomes 0 on first save
+    logical_seen: Set[str] = set()
+
+    all_paths: List[str] = []
+    all_caps: List[str] = []
+    declared_total: Optional[int] = None
+
+    photos_had_any = False
+
+    for label, url in order:
+        if label == "main" and cfg.prefer_photos_page and (photos_had_any or (declared_total is not None and cfg.strict_cap_to_declared)):
+            break
+
+        fc, sc, paths, caps, final_url, status, soup, decl = process_page(
+            client=client,
+            url=url,
+            speech_id=sid,
+            dst_dir=dst_dir,
+            hashes=hashes,
+            recs=recs,
+            seq_counter=seq_counter,
+            logical_seen=logical_seen,
+            source_label=label,
+            force_jpg_ext=cfg.force_jpg_ext,
+        )
+
+        if label != "main":
+            photos_had_any = photos_had_any or (fc > 0 or sc > 0)
+
+        if decl is not None and declared_total is None:
+            declared_total = decl
+
+        if label == "main" and soup and not article_soup:
+            article_soup = soup
+            final_article_url = final_url
+
+        all_paths += paths
+        all_caps += caps
+
+        if label != "main" and soup:
+            p_paths, p_caps, decl_from_pages = crawl_photos_pagination(
+                client=client,
+                first_photos_url=final_url,
+                speech_id=sid,
+                dst_dir=dst_dir,
+                hashes=hashes,
+                recs=recs,
+                seq_counter=seq_counter,
+                logical_seen=logical_seen,
+                delay_between_pages=cfg.delay_between_pages,
+                force_jpg_ext=cfg.force_jpg_ext,
+            )
+            if decl_from_pages is not None and declared_total is None:
+                declared_total = decl_from_pages
+            if p_paths:
+                photos_had_any = True
+                all_paths += p_paths
+                all_caps += p_caps
+
+        time.sleep(cfg.delay_between_pages)
+
+    # strict cap
+    if cfg.strict_cap_to_declared and declared_total is not None and len(all_paths) > declared_total:
+        extra = all_paths[declared_total:]
+        for rel in extra:
+            try:
+                os.remove(os.path.join(cfg.images_root, rel))
+            except Exception:
+                pass
+        all_paths = all_paths[:declared_total]
+        all_caps = all_caps[:declared_total]
+
+    # manifest
+    if recs:
+        os.makedirs(os.path.dirname(manifest_path), exist_ok=True)
+        with open(manifest_path, "w", encoding="utf-8") as mf:
+            for r in recs:
+                mf.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+    # Extract text/meta used by schema
+    title_for_logging = ""
+    date_str = month = day = year = tim = ""
+    location = ""
+    topics: List[str] = []
+    full_text = ""
+    page_summary = ""
+
+    if article_soup:
+        title_for_logging = parse_title(article_soup)
+        date_str, month, day, year, tim = parse_date_fields(article_soup)
+        location = parse_location(article_soup)
+        topics = parse_topics(article_soup)
+        full_text = parse_body_text(article_soup)
+        page_summary = extract_page_summary(article_soup)
+
+    word_count = len(full_text.split()) if full_text else 0
+
+    saved_images_count = len(all_paths)
+    if saved_images_count == 0:
+        remove_dir_if_exists(dst_dir)
+
+    if not ((title_for_logging or full_text) or (saved_images_count > 0)):
+        return None, pre_status, title_for_logging
+
+    # Build strict row with only schema keys
+    row = empty_row()
+    row["id"] = sid
+    row["url"] = final_article_url or main_url
+
+    row["full_text_word_count"] = word_count
+    row["date"] = date_str
+    row["year"] = year
+    row["month"] = month
+    row["day"] = day
+    row["time"] = tim
+
+    # Language placement rule (no guessing):
+    # RU -> base columns, EN -> *_english columns
+    row["location"] = location
+    row["page_summary"] = page_summary
+    row["declared_topics"] = "|".join(topics) if topics else ""
+    row["image_captions"] = json.dumps(all_caps, ensure_ascii=False)
+
+    row["stored_image_filepaths"] = json.dumps(all_paths, ensure_ascii=False)
+    row["saved_images_count"] = saved_images_count
+
+    if declared_total is None:
+        row["declared_images_count"] = ""
+        row["missing_images_count"] = ""
+    else:
+        row["declared_images_count"] = declared_total
+        row["missing_images_count"] = (declared_total - saved_images_count)
+
+    return row, pre_status, title_for_logging
+
+
+# ---------------------------
+# CSV utilities
+# ---------------------------
+
+def read_done_ids(csv_path: str) -> Set[str]:
+    if not os.path.exists(csv_path):
+        return set()
+    done = set()
+    try:
+        with open(csv_path, "r", encoding="utf-8", newline="") as f:
+            r = csv.DictReader(f)
+            # must match our schema; but tolerate if file exists with 'id'
+            for row in r:
+                v = (row.get("id") or "").strip()
+                if v:
+                    done.add(v)
+    except Exception:
+        return set()
+    return done
+
+
+def read_index_ids(index_csv_path: str) -> Set[str]:
+    """
+    If index file missing, returns empty set (meaning: scrape all IDs in range).
+    """
+    if not os.path.exists(index_csv_path):
+        print(f"[index] WARNING: {index_csv_path} not found; will scrape ALL IDs in range.")
+        return set()
+
+    ids = set()
+    try:
+        with open(index_csv_path, "r", encoding="utf-8", newline="") as f:
+            r = csv.DictReader(f)
+            fields = r.fieldnames or []
+            key = "id"
+            if key is None:
+                print("[index] WARNING: index CSV has no 'id' or 'ID' column; ignoring index filter.")
+                return set()
+
+            for row in r:
+                v = (row.get(key) or "").strip()
+                if v:
+                    ids.add(v)
+    except Exception as e:
+        print(f"[index] ERROR reading {index_csv_path}: {e}")
+        return set()
+
+    print(f"[index] loaded {len(ids)} IDs from {index_csv_path}")
+    return ids
+
+
+def append_rows(rows: List[dict], csv_path: str) -> None:
+    exists = os.path.exists(csv_path)
+    with open(csv_path, "a", encoding="utf-8", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=FIELDNAMES, extrasaction="raise")
+        if not exists:
+            w.writeheader()
+        for row in rows:
+            # Hard safety: ensure row has no extra keys and no missing keys
+            if set(row.keys()) != set(FIELDNAMES):
+                missing = sorted(set(FIELDNAMES) - set(row.keys()))
+                extra = sorted(set(row.keys()) - set(FIELDNAMES))
+                raise ValueError(f"Row keys mismatch. missing={missing} extra={extra}")
+            w.writerow(row)
+
+
+# ---------------------------
+# Driver
+# ---------------------------
+
+def run(cfg: Config) -> None:
+    os.makedirs(cfg.manifest_root, exist_ok=True)
+    os.makedirs(cfg.images_root, exist_ok=True)
+
+    client = HttpClient(cfg)
+
+    already = read_done_ids(cfg.out_csv)
+    index_ids = read_index_ids(cfg.index_csv)
+
+    batch: List[dict] = []
+
+    for i in range(cfg.start_id, cfg.end_id + 1):
+        sid = str(i)
+
+        if index_ids and sid not in index_ids:
+            continue
+
+        if sid in already:
+            print(f"[{sid}] SKIP already in CSV")
+            continue
+
+        attempt = 0
+        while True:
+            try:
+                row, status_code, title_for_log = harvest_one_id(client, cfg, i)
+                sc = status_code if status_code is not None else "NA"
+
+                if row is not None:
+                    batch.append(row)
+                    print(f"[{sid}] ok status={sc} title='{(title_for_log or '')[:60]}' saved_images={row['saved_images_count']} declared_images={row['declared_images_count']} missing={row['missing_images_count']}")
+                    break
+
+                if isinstance(sc, int) and sc in cfg.block_statuses and attempt < cfg.max_id_retries:
+                    wait = cfg.backoff_base * (2 ** attempt) + random.uniform(0, cfg.backoff_jitter)
+                    attempt += 1
+                    print(f"[{sid}] blocked status={sc}; retry {attempt}/{cfg.max_id_retries} after {wait:.1f}s")
+                    time.sleep(wait)
+                    continue
+
+                print(f"[{sid}] skipped status={sc} (no meaningful data)")
+                remove_dir_if_exists(os.path.join(cfg.images_root, sid))
+                break
+
+            except requests.HTTPError as e:
+                code = getattr(e.response, "status_code", None)
+                print(f"[{sid}] HTTP error status={code if code is not None else 'NA'}: {e}")
+                remove_dir_if_exists(os.path.join(cfg.images_root, sid))
+                break
+            except requests.RequestException as e:
+                print(f"[{sid}] NET error: {e}")
+                remove_dir_if_exists(os.path.join(cfg.images_root, sid))
+                break
+            except Exception as e:
+                print(f"[{sid}] ERROR: {e}")
+                remove_dir_if_exists(os.path.join(cfg.images_root, sid))
+                break
+
+        if len(batch) >= 5:
+            append_rows(batch, cfg.out_csv)
+            print(f"[CSV] wrote {len(batch)} rows -> {cfg.out_csv}")
+            batch = []
+
+        time.sleep(cfg.delay_between_ids)
+
+    if batch:
+        append_rows(batch, cfg.out_csv)
+        print(f"[CSV] wrote {len(batch)} rows -> {cfg.out_csv} (final)")
+
+
+# ---------------------------
+# CLI
+# ---------------------------
+
+def parse_args() -> argparse.Namespace:
+    ap = argparse.ArgumentParser(description="Scrape Kremlin transcripts + images (RU/EN) with strict CSV schema.")
+    ap.add_argument("--lang", choices=["ru", "en"], default="ru", help="Site language: ru or en.")
+    ap.add_argument("--base-url", default="", help="Override base URL (must end with /).")
+
+    ap.add_argument("--out-csv", default="kremlin_transcripts_strict.csv")
+    ap.add_argument("--index-csv", default="kremlin_transcript_index.csv")
+    ap.add_argument("--images-root", default="kremlin_images")
+    ap.add_argument("--manifest-root", default="manifests")
+
+    ap.add_argument("--start-id", type=int, default=1)
+    ap.add_argument("--end-id", type=int, default=200000)
+
+    ap.add_argument("--prefer-photos-page", type=int, default=0)
+    ap.add_argument("--strict-cap-to-declared", type=int, default=1)
+    ap.add_argument("--purge-before-save", type=int, default=0)
+    ap.add_argument("--force-jpg-ext", type=int, default=1)
+
+    ap.add_argument("--delay-between-ids", type=float, default=9)
+    ap.add_argument("--delay-between-pages", type=float, default=9)
+    ap.add_argument("--timeout", type=int, default=100)
+
+    ap.add_argument("--max-transport-retries", type=int, default=3)
+    ap.add_argument("--max-id-retries", type=int, default=4)
+    ap.add_argument("--backoff-base", type=float, default=10)
+    ap.add_argument("--backoff-jitter", type=float, default=5)
+
+    # proxies (optional)
+    ap.add_argument("--proxy-mode", choices=["none", "static", "rotating"], default="none")
+    ap.add_argument("--static-proxy", default=os.getenv("STATIC_PROXY", ""))
+    ap.add_argument("--proxy-list", default="", help="Comma-separated proxy URLs for rotating mode.")
+    ap.add_argument("--rotate-every-seconds", type=float, default=100)
+
+    return ap.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+
+    base_default, accept_lang = default_base_and_lang(args.lang)
+    base_url = (args.base_url.strip() or base_default).strip()
+    if not base_url.endswith("/"):
+        base_url += "/"
+
+    proxy_list = [p.strip() for p in (args.proxy_list or "").split(",") if p.strip()]
+
+    cfg = Config(
+        lang=args.lang,
+        base_url=base_url,
+        accept_language=accept_lang,
+
+        out_csv=args.out_csv,
+        index_csv=args.index_csv,
+        images_root=args.images_root,
+        manifest_root=args.manifest_root,
+
+        start_id=args.start_id,
+        end_id=args.end_id,
+
+        prefer_photos_page=bool(args.prefer_photos_page),
+        strict_cap_to_declared=bool(args.strict_cap_to_declared),
+        purge_before_save=bool(args.purge_before_save),
+        force_jpg_ext=bool(args.force_jpg_ext),
+
+        delay_between_ids=args.delay_between_ids,
+        delay_between_pages=args.delay_between_pages,
+        timeout=args.timeout,
+
+        max_transport_retries=args.max_transport_retries,
+        max_id_retries=args.max_id_retries,
+        backoff_base=args.backoff_base,
+        backoff_jitter=args.backoff_jitter,
+        block_statuses=set(BLOCK_STATUSES_DEFAULT),
+
+        proxy_mode=args.proxy_mode,
+        static_proxy=args.static_proxy,
+        proxy_list=proxy_list,
+        rotate_every_seconds=args.rotate_every_seconds,
+    )
+
+    print(f"[config] lang={cfg.lang} base_url={cfg.base_url}")
+    print(f"[config] image naming: <ID>_<seq>.jpg inside {cfg.images_root}/<ID>/")
+    print(f"[config] CSV columns: {len(FIELDNAMES)} (strict, exact user schema)")
+
+    run(cfg)
+
+
+if __name__ == "__main__":
+    main()

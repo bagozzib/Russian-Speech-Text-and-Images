@@ -1,348 +1,230 @@
 # -*- coding: utf-8 -*-
 """
-MID minister speeches index crawler (English + Russian)
+MID minister speeches ID index crawler (EN + RU) -> 2 separate CSV files
 
-What this script does
----------------------
-- Crawls MID "minister_speeches" list pages.
-- Extracts each item’s numeric ID, absolute URL, and title.
-- Writes/append to a CSV: columns = [page, id, url, title].
-- Safe to re-run: de-duplicates on `id` (unique per item).
+Outputs (default):
+- mid_english_index.csv
+- mid_russian_index.csv
 
-How to use (EN vs RU)
----------------------
-MID has language-specific bases (confirm the exact paths you use in your paper/pipeline):
-
-Common pattern you were using:
-- English: https://mid.ru/en/press_service/minister_speeches/
-- Russian: https://mid.ru/ru/press_service/minister_speeches/
-
-Set LANG = "en" or "ru" below and the script will select BASE + output CSV name.
-
-Notes about MID bot protection
-------------------------------
-MID sometimes serves JS / TSPD challenge pages. This script:
-1) Tries curl_cffi (TLS impersonation) first (better success rate)
-2) Falls back to requests
-3) If a challenge is detected, it retries an alternate URL form once
-4) Optionally dumps empty-page HTML for debugging
-
-Python: 3.x
+Each CSV columns:
+- page_num, id, url
 """
 
-from __future__ import annotations
-
-import csv
 import os
-import random
+import csv
 import re
 import time
-from dataclasses import dataclass
-from typing import List, Optional, Set, Tuple
-from urllib.parse import urljoin
-
+import random
+import requests
 from bs4 import BeautifulSoup
 
+# -----------------------
+# CONFIG YOU MAY CHANGE
+# -----------------------
 
-# ----------------------------
-# Configuration
-# ----------------------------
-
-LANG = "en"  # "en" or "ru"
-
-BASE_BY_LANG = {
-    "en": "https://mid.ru/en/press_service/minister_speeches/",
-    "ru": "https://mid.ru/ru/press_service/minister_speeches/",
+LANG_CONFIG = {
+    "en": {
+        "base": "https://mid.ru/en/press_service/minister_speeches/",
+        "out_csv": "mid_english_index.csv",
+        "accept_language": "en-US,en;q=0.9",
+        # set end_page to an integer if you want a fixed range, or None to run-until-empty
+        "start_page": 1,
+        "end_page": 507,
+        "id_re": re.compile(r"/en/press_service/minister_speeches/(\d+)(?:/|$)", re.I),
+    },
+    "ru": {
+        "base": "https://mid.ru/ru/press_service/minister_speeches/",
+        "out_csv": "mid_russian_index.csv",
+        "accept_language": "ru-RU,ru;q=0.9,en-US;q=0.4,en;q=0.3",
+        "start_page": 1,
+        "end_page": 607,
+        "id_re": re.compile(r"/ru/press_service/minister_speeches/(\d+)(?:/|$)", re.I),
+    },
 }
 
-OUTPUT_CSV_BY_LANG = {
-    "en": "mid_minister_speeches_index_english.csv",
-    "ru": "mid_minister_speeches_index_russian.csv",
-}
+USER_AGENT = "your_email@udel.edu"  # keep one contact here (or change as you like)
 
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/124.0.0.0 Safari/537.36"
-    ),
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Connection": "keep-alive",
-}
+DELAY_BASE = 0.4
+DELAY_JITTER = (0.1, 0.4)
+STOP_AFTER_EMPTY = 2
+MAX_PAGES = None          # optional cap (per language); None = no cap
+TIMEOUT = 30
+RETRIES = 2
+CHECKPOINT_SIZE = 500     # flush every N new IDs (per language)
 
-# List pages are accessed via query param like:
-#   https://mid.ru/en/press_service/minister_speeches/?PAGEN_1=1
-PAGE_PARAM = "PAGEN_1"
+# -----------------------
+# HELPERS
+# -----------------------
 
-# De-dup key: numeric ID at end of URL
-ID_RE = re.compile(r"/(\d+)(?:/)?$")
+def sleep_a_bit():
+    time.sleep(DELAY_BASE + random.uniform(*DELAY_JITTER))
 
-# CSV columns
-FIELDNAMES = ["page", "id", "url", "title"]
+def build_headers(accept_language: str):
+    return {
+        "User-Agent": USER_AGENT,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": accept_language,
+        "Connection": "keep-alive",
+    }
 
-# Networking
-DEFAULT_TIMEOUT_SECONDS = 45
-
-
-# ----------------------------
-# Data model
-# ----------------------------
-
-@dataclass(frozen=True)
-class IndexItem:
-    page: int
-    id: str
-    url: str
-    title: str
-
-
-# ----------------------------
-# HTTP fetching (curl_cffi -> requests fallback)
-# ----------------------------
-
-def fetch_html(url: str, timeout: int = DEFAULT_TIMEOUT_SECONDS) -> str:
-    """
-    Fetch HTML for `url`.
-
-    Strategy:
-      1) curl_cffi with browser impersonation (best for MID challenges)
-      2) fallback to requests.Session()
-
-    Returns empty string if all methods fail.
-    """
-    text: Optional[str] = None
-
-    # Try curl_cffi first
-    try:
-        from curl_cffi import requests as curlreq  # type: ignore
-        r = curlreq.get(
-            url,
-            headers=HEADERS,
-            timeout=timeout,
-            impersonate="chrome124",
-            allow_redirects=True,
-        )
-        if r.status_code == 200:
-            text = r.text
-    except Exception:
-        pass
-
-    # Fallback: requests
-    if text is None:
+def get_soup(session: requests.Session, url: str, headers: dict) -> BeautifulSoup | None:
+    """Fetch URL and return BeautifulSoup, or None on challenge/empty/error."""
+    for _ in range(RETRIES):
         try:
-            import requests  # type: ignore
-            with requests.Session() as s:
-                s.headers.update(HEADERS)
-                r = s.get(url, timeout=timeout, allow_redirects=True)
-                if r.status_code == 200:
-                    text = r.text
-        except Exception:
-            text = None
-
-    return text or ""
-
-
-def looks_like_challenge(html_text: str) -> bool:
-    """
-    Detect common MID anti-bot / JS challenge patterns.
-    """
-    if not html_text:
-        return True
-    markers = (
-        "/TSPD/",
-        "Please enable JavaScript",
-        "Access denied",
-        "verify you are human",
-    )
-    return any(m in html_text for m in markers)
-
-
-# ----------------------------
-# Parsing
-# ----------------------------
-
-def extract_id_from_url(url: str) -> Optional[str]:
-    """
-    Extract numeric ID from the end of a URL.
-    Example: https://mid.ru/.../12345/  -> "12345"
-    """
-    m = ID_RE.search(url or "")
-    return m.group(1) if m else None
-
-
-def parse_list_page(html_text: str, base_url: str) -> List[Tuple[str, str, str]]:
-    """
-    Parse a list page HTML and return list of (id, abs_url, title).
-
-    Your original selector:
-      a.announce__link.announce__link_fix_en[href]
-
-    NOTE:
-    - This is *English-specific* class naming (fix_en).
-    - For Russian pages, the class may differ.
-      If RU returns 0 items consistently, inspect the RU HTML and adjust selector(s).
-    """
-    soup = BeautifulSoup(html_text, "lxml")
-    out: List[Tuple[str, str, str]] = []
-
-    anchors = soup.select("a.announce__link.announce__link_fix_en[href]")
-    for a in anchors:
-        href = (a.get("href") or "").strip()
-        if not href:
+            sleep_a_bit()
+            r = session.get(url, headers=headers, timeout=TIMEOUT)
+            r.raise_for_status()
+            text = r.text or ""
+            # Bail on obvious JS/challenge pages
+            if "/TSPD/" in text or "Please enable JavaScript" in text:
+                return None
+            return BeautifulSoup(r.content, "html.parser")
+        except requests.RequestException:
             continue
+    return None
 
-        abs_url = urljoin(base_url, href)
-        item_id = extract_id_from_url(abs_url)
-        title = " ".join((a.get_text(" ", strip=True) or "").split())
+def extract_ids_from_soup(soup: BeautifulSoup | None, id_re: re.Pattern) -> list[str]:
+    """Return unique IDs found on a listing page."""
+    if not soup:
+        return []
 
-        if item_id:
-            out.append((item_id, abs_url, title))
+    seen_local = set()
+    ids = []
 
-    return out
+    # Strict selector first (what you were using)
+    for a in soup.select('a.announce__link.announce__link_fix_en[href]'):
+        href = a.get("href") or ""
+        m = id_re.search(href)
+        if m:
+            _id = m.group(1)
+            if _id not in seen_local:
+                seen_local.add(_id)
+                ids.append(_id)
 
-
-# ----------------------------
-# CSV utilities
-# ----------------------------
-
-def load_existing_ids(csv_path: str) -> Set[str]:
-    """
-    Read existing output CSV and return a set of IDs already written.
-    """
-    if not os.path.exists(csv_path):
-        return set()
-
-    ids: Set[str] = set()
-    try:
-        with open(csv_path, "r", encoding="utf-8", newline="") as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                rid = (row.get("id") or "").strip()
-                if rid:
-                    ids.add(rid)
-    except Exception:
-        pass
+    # Fallback: scan HTML strictly for the configured language regex
+    if not ids:
+        html_text = str(soup)
+        for m in id_re.finditer(html_text):
+            _id = m.group(1)
+            if _id not in seen_local:
+                seen_local.add(_id)
+                ids.append(_id)
 
     return ids
 
+def url_for_id(base: str, _id: str) -> str:
+    return f"{base}{_id}/"
 
-def append_rows(csv_path: str, rows: List[IndexItem]) -> None:
-    """
-    Append IndexItem rows to CSV, writing header if needed.
-    """
+def read_existing_ids(csv_path: str) -> set[str]:
+    exist = set()
+    if not os.path.exists(csv_path):
+        return exist
+    try:
+        with open(csv_path, "r", encoding="utf-8", newline="") as f:
+            r = csv.DictReader(f)
+            for row in r:
+                rid = (row.get("id") or "").strip()
+                if rid:
+                    exist.add(rid)
+    except Exception:
+        pass
+    return exist
+
+def append_rows(csv_path: str, rows: list[dict]):
     exists = os.path.exists(csv_path)
     with open(csv_path, "a", encoding="utf-8", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=FIELDNAMES)
+        w = csv.DictWriter(f, fieldnames=["page_num", "id", "url"])
         if not exists:
             w.writeheader()
+        for row in rows:
+            w.writerow(row)
 
-        for r in rows:
-            w.writerow({"page": r.page, "id": r.id, "url": r.url, "title": r.title})
+# -----------------------
+# MAIN WORK (per language)
+# -----------------------
 
+def crawl_one_language(lang_key: str):
+    cfg = LANG_CONFIG[lang_key]
+    base = cfg["base"]
+    out_csv = cfg["out_csv"]
+    start_page = cfg["start_page"]
+    end_page = cfg["end_page"]
+    id_re = cfg["id_re"]
+    headers = build_headers(cfg["accept_language"])
 
-# ----------------------------
-# Main crawl
-# ----------------------------
+    print(f"\n===== LANG={lang_key.upper()} =====")
+    print(f"[init] base   -> {base}")
+    print(f"[init] outcsv -> {out_csv}")
 
-def crawl_index(
-    base_url: str,
-    output_csv: str,
-    start_page: int = 1,
-    end_page: Optional[int] = None,
-    delay_min: float = 1.0,
-    delay_max: float = 2.0,
-    stop_after_empty: int = 2,
-    dump_empty_html: bool = True,
-) -> None:
-    """
-    Walk list pages and write index rows (page,id,url,title).
-
-    Stopping logic:
-      - Stop if `end_page` reached, OR
-      - Stop after `stop_after_empty` consecutive pages with 0 parsed items.
-        (Useful when you don't know the final page count.)
-    """
-    existing = load_existing_ids(output_csv)
-    print(f"[init] output={output_csv} | existing IDs={len(existing)}")
+    seen = read_existing_ids(out_csv)
+    if seen:
+        print(f"[init] already have {len(seen)} IDs in {out_csv}")
 
     empty_streak = 0
     page = start_page
+    batch = []
+    total_inserted = 0
 
-    while True:
-        if end_page is not None and page > end_page:
-            break
-
-        list_url = f"{base_url}?{PAGE_PARAM}={page}"
-        print(f"[page {page}] -> {list_url}")
-
-        html_text = fetch_html(list_url)
-
-        # If it looks like a challenge, retry an alternate URL form once
-        if looks_like_challenge(html_text):
-            alt_url = urljoin(base_url, f"{PAGE_PARAM}={page}")
-            print(f"[page {page}] challenge/empty suspected; retrying alt -> {alt_url}")
-            html_text2 = fetch_html(alt_url)
-            if len(html_text2) > len(html_text):
-                html_text = html_text2
-
-        items = parse_list_page(html_text, base_url)
-        print(f"[page {page}] parsed_items={len(items)}")
-
-        if not items:
-            empty_streak += 1
-
-            if dump_empty_html:
-                try:
-                    dbg_path = f"mid_{LANG}_page_{page}_empty.html"
-                    with open(dbg_path, "w", encoding="utf-8") as fw:
-                        fw.write(html_text)
-                    print(f"[debug] dumped HTML -> {dbg_path}")
-                except Exception:
-                    pass
-
-            if empty_streak >= stop_after_empty:
-                print(f"[stop] hit {empty_streak} consecutive empty pages. stopping.")
+    with requests.Session() as session:
+        while True:
+            if end_page is not None and page > end_page:
                 break
-        else:
-            empty_streak = 0
+            if MAX_PAGES and (page - start_page + 1) > MAX_PAGES:
+                break
 
-            new_rows: List[IndexItem] = []
-            for item_id, abs_url, title in items:
-                if item_id in existing:
-                    continue
-                new_rows.append(IndexItem(page=page, id=item_id, url=abs_url, title=title))
+            q_url = f"{base}?PAGEN_1={page}"
+            slash_url = f"{base}PAGEN_1={page}"
 
-            if new_rows:
-                append_rows(output_csv, new_rows)
-                for r in new_rows:
-                    existing.add(r.id)
-                print(f"[csv] wrote {len(new_rows)} new rows | total IDs now {len(existing)}")
+            soup = get_soup(session, q_url, headers) or get_soup(session, slash_url, headers)
+            ids = extract_ids_from_soup(soup, id_re)
+
+            if not ids:
+                print(f"[page {page}] found 0 ids")
+                empty_streak += 1
+                if empty_streak >= STOP_AFTER_EMPTY:
+                    print("[stop] consecutive empty pages reached. stopping.")
+                    break
             else:
-                print("[csv] no new IDs on this page (all duplicates)")
+                empty_streak = 0
+                new_rows = []
+                for _id in ids:
+                    if _id in seen:
+                        continue
+                    seen.add(_id)
+                    new_rows.append({"page_num": page, "id": _id, "url": url_for_id(base, _id)})
 
-        # Random delay to reduce bot detection
-        time.sleep(random.uniform(delay_min, delay_max))
-        page += 1
+                inserted = len(new_rows)
+                if inserted:
+                    batch.extend(new_rows)
+                    total_inserted += inserted
 
+                print(f"[page {page}] found={len(ids)} inserted={inserted} total_inserted={total_inserted}")
+
+                # checkpoint flush
+                if len(batch) >= CHECKPOINT_SIZE:
+                    append_rows(out_csv, batch)
+                    print(f"[checkpoint] wrote {len(batch)} rows -> {out_csv}")
+                    batch = []
+                    # reload for safest dedupe after restarts
+                    seen = read_existing_ids(out_csv)
+
+            page += 1
+
+    if batch:
+        append_rows(out_csv, batch)
+        print(f"[final] wrote {len(batch)} remaining rows -> {out_csv}")
+
+    print(f"[done] {lang_key.upper()} total inserted: {total_inserted}")
+
+def main(run_lang: str = "both"):
+    if run_lang not in ("en", "ru", "both"):
+        raise ValueError("run_lang must be 'en', 'ru', or 'both'")
+
+    if run_lang in ("en", "both"):
+        crawl_one_language("en")
+    if run_lang in ("ru", "both"):
+        crawl_one_language("ru")
 
 if __name__ == "__main__":
-    if LANG not in BASE_BY_LANG:
-        raise ValueError(f"LANG must be one of {list(BASE_BY_LANG.keys())}, got: {LANG}")
-
-    BASE = BASE_BY_LANG[LANG]
-    OUTPUT_CSV = OUTPUT_CSV_BY_LANG[LANG]
-
-    # Examples:
-    # crawl_index(BASE, OUTPUT_CSV, start_page=1, end_page=50)    # fixed range
-    # crawl_index(BASE, OUTPUT_CSV, start_page=1, end_page=None)  # run until empty pages encountered
-    crawl_index(
-        base_url=BASE,
-        output_csv=OUTPUT_CSV,
-        start_page=1,
-        end_page=None,
-        delay_min=1.0,
-        delay_max=2.0,
-        stop_after_empty=2,
-        dump_empty_html=True,
-    )
+    # default: run both
+    main(run_lang="both")

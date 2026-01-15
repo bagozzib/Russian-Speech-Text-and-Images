@@ -14,9 +14,9 @@ How to use (EN vs RU)
 Kremlin has separate transcript indexes:
 
 1) Kremlin EN transcripts (English):
-   BASE_SECTION = "http://en.kremlin.ru/events/president/transcripts/"
+   BASE_SECTION = "http://en.special.kremlin.ru/events/president/transcripts/"
    Index pages look like:
-   http://en.kremlin.ru/events/president/transcripts/page/1
+   http://en.special.kremlin.ru/events/president/transcripts/page/1
 
 2) Kremlin RU transcripts (Russian):
    BASE_SECTION = "http://special.kremlin.ru/events/president/transcripts/"
@@ -73,7 +73,7 @@ BASE_SECTION_BY_LANG = {
     # Russian transcript index
     "ru": "http://special.kremlin.ru/events/president/transcripts/",
     # English transcript index
-    "en": "http://en.kremlin.ru/events/president/transcripts/",
+    "en": "http://en.special.kremlin.ru/events/president/transcripts/",
 }
 
 # Pagination uses: {BASE_SECTION}/page/{page}

@@ -1,0 +1,31 @@
+# Core
+pandas==2.2.2
+numpy>=2,<2.3
+tqdm>=4.67
+pillow>=10.4
+requests
+
+# Topic modeling / clustering
+scikit-learn>=1.5,<1.6
+bertopic==0.16.4
+umap-learn==0.5.6
+hdbscan==0.8.40
+sentence-transformers==3.0.1
+transformers==4.44.2
+
+# BERTopic coherence + text utils
+gensim
+
+pyarrow>=16.1.0
+jedi>=0.19.1
+
+# Image-topic scoring (CLIP)
+open-clip-torch
+
+# Google Sheets / Auth (Colab)
+gspread
+google-auth
+
+# Web scraping
+beautifulsoup4
+python-dateutil

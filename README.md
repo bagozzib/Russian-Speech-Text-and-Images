@@ -1,24 +1,24 @@
-# CITES Attendee Data Extraction and Analysis
+# Linked Multi-Model Data on Russian Domestic and Foreign Policy Speeches
 
 ## Table of Contents
 - [Description](#description)
 - [Installation](#installation)
-- [Usage](#usage)
-- [File Structure](#folder-structure)
+- [File Structure and Usage](#folder-structure-and-usage)
 - [Contributors](#contributors)
 - [License](#license)
 
 
 ## Description:
-The code in this repository extracts, classifies, and formats attendee records from the Convention on International Trade in Endangered Species of Wild Fauna and Flora (CITES) Conference of the Parties (CoP) rosters (CoP1–CoP20). Source documents are mixed text/scan PDFs with multi-column layouts and multilingual headings; the pipeline performs layout-aware parsing/OCR, detects delegation headers, identifies person starts, and normalizes names. The primary attendee output consists of Delegation, Honorific, Person Name, and Affiliation.
-In addition, the repo includes routines to standardize person names (e.g., LAST, First → First Last), harmonize delegation names, flag multilingual delegation strings, add ISO/COW country codes, derive CoP year and host city, geolocate affiliations and CoP cities (lat/long), compute attendee–CoP distances, flag GeoPrecision status, and construct a female indicator by combining honorifics with a first-name–based gender guess.
+This repository builds a linked, multimodal dataset of Russian political speeches and related images from two official sources — the Kremlin (President of Russia) website and the Russian Ministry of Foreign Affairs (MID.ru) — across English and Russian corpora. The pipeline scrapes speech pages, extracts and cleans metadata (IDs, URLs, dates, titles, locations/lat/long, speakers, full text and English translations where applicable), and downloads associated page images into per-speech folders. For topic modeling, it runs BERTopic (SentenceTransformers + UMAP + HDBSCAN) to generate top-K topic candidates per speech and then assigns TOP-1 curated topics using manually curated topic dictionaries (topic_id → label + group) for each corpus.
+
+In addition, the repo includes image-topic scoring that assigns a TOP-1 topic per image using CLIP-based similarity scoring, exporting an image-topics file aligned to each speech’s stored_image_filepaths order. Finally, the pipeline merges all outputs back into a single master CSV by adding standardized curated columns for both text and images: curated_topic_id, curated_text_topic_label, curated_text_topic_group, curated_topic_probability, and the aligned per-image arrays curated_image_topic_ids, curated_image_topic_labels, curated_image_group_names, curated_image_topic_probabilities.
 
 ## Installation:
 To set up the project environment, follow these steps:
 
 1. **Clone the repository:**
    ```
-   git clone https://github.com/bagozzib/CITES_Data.git
+   [git clone https://github.com/bagozzib/CITES_Data.git](https://github.com/bagozzib/Russian-Speech-Text-and-Images.git)
    ```
    
 2. **Install the required packages:**
@@ -26,55 +26,62 @@ To set up the project environment, follow these steps:
    pip install -r requirements.txt
    ```
 
-## Usage:
-   For detailed usage instructions, please refer to the project [CITES Project Code Execution Steps](https://github.com/bagozzib/CITES_Data/wiki/CITES-Project-Code--Execution-Steps) WIKI.
+## File Structure and Usage:
 
- ## Folder Structure:
-   - **master_data**: This directory holds the final dataset as a definitive CSV file.
-        - Files:
-           -  cites.cops.csv
-        
-   - **python_files**: These scripts are designed for PDF text extraction and classification, facilitating the generation of CSV files.
-        - Files:
-           - extract_pdf_data.py: Orchestrates PDF parsing; routes pages to the appropriate extractor (text vs. scan; single/dual column), applies page-level cleanup, and writes the initial rows.
+### `python_code/` (core pipeline)
+- **`webscraping_code/`**  
+  Scrapers that collect **speech pages, metadata, and images** from each source site.
+  - `kremlin/` — Kremlin-specific scraping, and parsing logic  
+  - `MID/` — MID-specific scraping, and parsing logic  
 
-          - processing_data.py – Post-extraction cleaning and harmonization: fixes wrap/merge artifacts, drops pagination noise, normalizes whitespace, resolves multilingual Delegation strings (Belgium/Bélgica/Belgique → Belgium), and de-duplicates.
-         
-          - standardize_person_names.py – Normalizes names to First Last (LAST, First and LAST First … → First Last; supports multi-token surnames).
-         
-          - hashing_person_names.py – Creates a stable anonymized attendee identifier ID by applying a salted cryptographic hash to each attendee’s standardized full name (from standardize_person_names.py), enabling linking/dedup without exposing identities.
+- **`prepare_index/`**  
+  Small helper scripts to prepare consistent **ID lists / index inputs** used downstream.
+  - `extract_ids_kremlin.py` — builds/updates Kremlin ID/index inputs  
+  - `extract_ids_mid.py` — builds/updates MID ID/index inputs  
 
-          - gender_guess.py – Adds a GenderGuess column (and a Female indicator) using first-name inference plus honorifics (Namsor API workflow).
 
-          - get_lat_lang.py – Geocodes affiliations and CoP host cities to latitude/longitude (Nominatim/ArcGIS with caching/backoffs).
+- **`bertopic_text_image_pipeline_all_datasets.ipynb`**  
+- The notebook runs **BERTopic** on the speech text (for **RU corpora it models `full_text_english`**, so topics align with EN).
+- It assigns **TOP-1 topic per speech** and produces topic metadata (e.g., keywords/sizes).
+- It then uses **CLIP-based scoring** to compare each image to topic representations and assigns each image a **TOP-1 topic** (highest similarity score).
+- Saves the updated CSVs/outputs for downstream analysis and visualization.
+  
+- **`Validation/`**  
+  Sanity checks to validate key outputs before publishing.
+  - `topic_validation.py` — checks topic outputs (missing topics, row counts, basic consistency)  
+  - `latitude_longitude_validation.py` — checks location fields / coordinate sanity
 
-          - haversine_distance.py – Computes great-circle distance (km) between attendee coordinates and the corresponding CoP city coordinates.
-         
-          - geoprivacy.py – Privacy-safe geolocation: reverse-geocodes each lat/long to detect overly precise address fields (street/house number/postcode/sub-city). If too precise, it re-geocodes only a coarse string (City–State/Province–Country → State/Province–Country → Country), rounds coordinates (City: 2 decimals; State/Country: 1), and writes published coordinates; otherwise sets GeoPrecision = NA when a safe point cannot be obtained.
-         
-          - standardize_gender_and_gender_technical_validation.py – Standardizes honorifics, derives a gold gender label from honorific rules, converts Female(Guess) into a predicted gender label, and computes validation metrics (confusion matrix + precision/recall/F1/accuracy) on rows where gold gender is available.
-         
-          - standardize_affiliation.py – Cleans the affiliation free-text field by removing contact identifiers (e.g., emails/phone numbers) and normalizing formatting; assigns AffiliationStatus to record whether the affiliation was kept or generalized for privacy (KeptOriginal, City, State, Country).
+---
 
-   - **r_code**: This directory contains R scripts designed for functions such as data cleaning and validation.
-       - Files:
-          - FinalDataCleaning.R – Reads CITES Extracted Data V2.xlsx, standardizes Status and creates Party/Observer dummies, harmonizes Delegation names (multi-language variants, historical names, typos), fixes known anomalies, adds COW country codes, and writes the final analysis file cites.cops.csv. 
-          - Descriptives.R – Reads cites.cops.csv, reports column-wise missingness, and generates a series of descriptive plots: MF.pdf (Female vs. Male over time), PO.pdf (Party vs. Observer over time), ShadedMap.pdf (choropleth of attendee counts), worldpoints.pdf (all geocoded points), and delegation_wordcloud.png (observer delegations).
-          - CITES Extracted Data V2.xlsx – Intermediate dataset emitted by the Python extractor; input to FinalDataCleaning.R.
-          - spatialvalidation.csv – 1,000-row sample for manual lat/long checks.
-          - spatialvalidation DB.csv – the manually coded results.
-          - add_source_url.R – Adds the original CITES PDF source URL per CoP (and parties/observers status when available).
+## Combined usage (recommended run order)
 
-     
-   - **requirements.txt**: This file enumerates the Python dependencies necessary for the project.
-     
+1) **Prepare IDs / index inputs**  
+   Run `python_code/prepare_index/extract_ids_kremlin.py` and `python_code/prepare_index/extract_ids_mid.py` so downstream steps reference stable, consistent speech IDs.
+
+2) **Scrape datasets (texts + images)**  
+   Run the scrapers inside `python_code/webscraping_code/` for **Kremlin** and **MID** to generate the extracted speech CSVs and download images.
+
+3) **Topic modeling + image-topic scoring**  
+   Open and run:  
+   `python_code/bertopic_text_image_pipeline_all_datasets.ipynb`  
+   This produces topic assignments for speeches (BERTopic) and images (CLIP scoring).
+
+4) **Validate outputs**  
+   Run scripts in `python_code/Validation/` to confirm outputs are clean (topic coverage, missingness, coordinate sanity where applicable).
+
 ## Conclusion
-  - We built a reproducible pipeline that reliably extracts and standardizes CITES COP attendee records from heterogeneous PDFs—combining layout-aware parsing/OCR, targeted heuristics (underlines/all-caps, honorific & dotted-initial name rules, multilingual slashes, email anchors), NLP checks, and light manual review—to produce consistent Delegation, Honorific, Person Name, and Affiliation fields ready for analysis.
-## Contributors:
-   - Benjamin E. Bagozzi (Corresponding author: bagozzib@udel.edu)
-   - Daria Blinova
-   - Rakesh Emuru
-   - Gayathri Emuru
+- We built a reproducible end-to-end pipeline that collects, cleans, and harmonizes Russian official speech texts and associated webpage images across two sources (Kremlin and MID) and four corpora (EN/RU per source).
+- The workflow standardizes metadata and IDs, models topics consistently using BERTopic (with the RU corpora modeled on `full_text_english` to align topic space with English), and assigns each image a TOP-1 topic via CLIP-based image–topic similarity scoring.
+- The result is a unified, analysis-ready dataset linking **speeches ↔ topics ↔ images ↔ image-topics**, with lightweight validation scripts to sanity-check topics and geolocation fields.
+
+## Contributors
+- Benjamin E. Bagozzi (Corresponding author: bagozzib@udel.edu)
+- Sunita Chandrasekaran
+- Daria Blinova
+- Gayathri Emuru
+- Rakesh Emuru
+- Kushagradheer Shridheer Srivastava
+- Mina Rulis
      
 ## License
 

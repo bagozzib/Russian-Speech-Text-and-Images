@@ -73,7 +73,7 @@ To set up the project environment, follow these steps:
 ## Conclusion
 - We built a reproducible end-to-end pipeline that collects, cleans, and harmonizes Russian official speech texts and associated webpage images across two sources (Kremlin and MID) and four corpora (EN/RU per source).
 - The workflow standardizes metadata and IDs, models topics consistently using BERTopic (with the RU corpora modeled on `full_text_english` to align topic space with English), and assigns each image a TOP-1 topic via CLIP-based image–topic similarity scoring.
-- The result is a unified, analysis-ready dataset linking **speeches ↔ topics ↔ images ↔ image-topics**, with lightweight validation scripts to sanity-check topics and geolocation fields.
+- The result is a unified, analysis-ready dataset linking **speeches, topics, images, image-topics**, with lightweight validation scripts to sanity-check topics and geolocation fields.
 
 ## Contributors
 - Benjamin E. Bagozzi (Corresponding author: bagozzib@udel.edu)

@@ -29,16 +29,17 @@ To set up the project environment, follow these steps:
 ## File Structure and Usage:
 
 ### `python_code/` (core pipeline)
-- **`webscraping_code/`**  
-  Scrapers that collect **speech pages, metadata, and images** from each source site.
-  - `kremlin/` — Kremlin-specific scraping, and parsing logic  
-  - `MID/` — MID-specific scraping, and parsing logic  
+
 
 - **`prepare_index/`**  
   Small helper scripts to prepare consistent **ID lists / index inputs** used downstream.
   - `extract_ids_kremlin.py` — builds/updates Kremlin ID/index inputs  
-  - `extract_ids_mid.py` — builds/updates MID ID/index inputs  
-
+  - `extract_ids_mid.py` — builds/updates MID ID/index inputs
+    
+- **`webscraping_code/`**  
+  Scrapers that collect **speech pages, metadata, and images** from each source site.
+  - `kremlin/` — Kremlin-specific scraping, and parsing logic  
+  - `MID/` — MID-specific scraping, and parsing logic  
 
 - **`bertopic_text_image_pipeline_all_datasets.ipynb`**  
 - The notebook runs **BERTopic** on the speech text (for **RU corpora it models `full_text_english`**, so topics align with EN).

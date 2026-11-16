@@ -18,7 +18,7 @@ To set up the project environment, follow these steps:
 
 1. **Clone the repository:**
    ```
-   [git clone https://github.com/bagozzib/CITES_Data.git](https://github.com/bagozzib/Russian-Speech-Text-and-Images.git)
+   git clone https://github.com/bagozzib/Russian-Speech-Text-and-Images.git
    ```
    
 2. **Install the required packages:**
